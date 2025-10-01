@@ -16,7 +16,7 @@ jobs:
     - name: Checkout Current Branch
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Fetch all history
+        fetch-depth: 0
     
     - name: Fetch and Setup Main Branch
       run: |
@@ -31,9 +31,6 @@ jobs:
         git branch -a
         
         echo "Current branch: $(git rev-parse --abbrev-ref HEAD)"
-        
-        echo "Testing main branch access..."
-        git show origin/main:src/database/wksp_ebs2cloud_migration/tables/test_data.sql || echo "Could not access test_data.sql from main"
     
     - name: Setup Python
       uses: actions/setup-python@v5
@@ -75,7 +72,6 @@ jobs:
                         continue
                     
                     if in_create:
-                        # Stop at constraints or end of CREATE TABLE
                         if (line_stripped.startswith('constraint') or 
                             line_stripped.startswith('primary key') or
                             line_stripped.startswith('foreign key') or
@@ -83,11 +79,9 @@ jobs:
                             line_stripped.startswith('/')):
                             break
                         
-                        # Match column definition
                         match = re.match(r'^(\w+)\s+(number|varchar2|date|timestamp|clob|blob|char)', line_stripped, re.IGNORECASE)
                         if match:
                             col_name = match.group(1).upper()
-                            # Get full column definition including constraints
                             col_def = line_stripped.rstrip(',').strip()
                             columns[col_name] = col_def
                 
@@ -101,17 +95,16 @@ jobs:
                 print(f"{'='*70}")
                 
                 if main_ddl:
-                    print("✓ Successfully read from MAIN branch")
+                    print("SUCCESS: Read from MAIN branch")
                     main_cols = self.extract_columns_from_ddl(main_ddl)
                     print(f"  Columns in MAIN: {sorted(main_cols.keys())}")
                 else:
                     main_cols = {}
-                    print("✗ Could not read from MAIN branch (treating as new table)")
+                    print("WARNING: Could not read from MAIN branch (treating as new table)")
                 
                 current_cols = self.extract_columns_from_ddl(current_ddl)
                 print(f"  Columns in CURRENT ({self.current_branch}): {sorted(current_cols.keys())}")
                 
-                # Find differences
                 new_cols = set(current_cols.keys()) - set(main_cols.keys())
                 dropped_cols = set(main_cols.keys()) - set(current_cols.keys())
                 
@@ -119,7 +112,6 @@ jobs:
                 print(f"    Added: {sorted(new_cols) if new_cols else 'None'}")
                 print(f"    Dropped: {sorted(dropped_cols) if dropped_cols else 'None'}")
                 
-                # Generate ALTER statements for new columns
                 for col in sorted(new_cols):
                     col_def = current_cols[col]
                     diff_msg = f"Added column '{col}'"
@@ -134,7 +126,6 @@ jobs:
                     self.alter_statements.append(alter_stmt)
                     print(f"    [+] {col}")
                 
-                # Generate ALTER statements for dropped columns
                 for col in sorted(dropped_cols):
                     diff_msg = f"Dropped column '{col}'"
                     self.differences.append({
@@ -175,13 +166,13 @@ jobs:
                     else:
                         f.write("-- No schema changes detected\n")
                 
-                print(f"\n✓ Migration script created: {alter_file}")
+                print(f"\nMigration script created: {alter_file}")
                 
                 summary_file = Path(f"diff-reports/summary-{branch}.md")
                 summary_file.parent.mkdir(parents=True, exist_ok=True)
                 
                 with open(summary_file, 'w') as f:
-                    f.write(f"# Schema Changes: main → {branch}\n\n")
+                    f.write(f"# Schema Changes: main to {branch}\n\n")
                     f.write(f"**Generated:** {timestamp}\n\n")
                     f.write(f"**Total Changes:** {len(self.differences)}\n\n")
                     f.write(f"---\n\n")
@@ -203,15 +194,15 @@ jobs:
                         
                         f.write("---\n\n")
                         f.write("## Migration SQL Script\n\n")
-                        f.write("```
+                        f.write("SQL Format:\n\n")
                         for stmt in self.alter_statements:
-                            f.write(f"{stmt}\n")
-                        f.write("```\n\n")
+                            f.write(f"    {stmt}\n")
+                        f.write("\n")
                     else:
                         f.write("No schema differences detected.\n")
                         f.write(f"The schema in branch {branch} is identical to main.\n")
                 
-                print(f"✓ Summary report created: {summary_file}")
+                print(f"Summary report created: {summary_file}")
                 return len(self.differences)
 
         def main():
@@ -225,37 +216,35 @@ jobs:
             print(f"\nCurrent Branch: {current_branch}")
             
             if current_branch == 'main':
-                print("\n⚠ On main branch - no comparison needed")
+                print("\nOn main branch - no comparison needed")
                 return
             
             schema_path = Path("src/database/wksp_ebs2cloud_migration/tables")
             
             if not schema_path.exists():
-                print(f"\n✗ Schema path not found: {schema_path}")
+                print(f"\nSchema path not found: {schema_path}")
                 return
             
-            print(f"✓ Schema Path: {schema_path}")
+            print(f"Schema Path: {schema_path}")
             
             sql_files = list(schema_path.glob("*.sql"))
             
             if not sql_files:
-                print(f"\n✗ No SQL files found in {schema_path}")
+                print(f"\nNo SQL files found in {schema_path}")
                 return
             
-            print(f"✓ Found {len(sql_files)} SQL file(s)")
+            print(f"Found {len(sql_files)} SQL file(s)")
             
             total_changes = 0
             
             for sql_file in sql_files:
                 current_ddl = sql_file.read_text()
                 
-                # Construct the correct git path
                 git_path = f'src/database/wksp_ebs2cloud_migration/tables/{sql_file.name}'
                 
-                print(f"\n  Fetching from main branch: {git_path}")
+                print(f"\nFetching from main branch: {git_path}")
                 
                 try:
-                    # Use origin/main instead of main
                     result = subprocess.run(
                         ['git', 'show', f'origin/main:{git_path}'],
                         capture_output=True,
@@ -266,15 +255,15 @@ jobs:
                     
                     if result.returncode == 0 and result.stdout.strip():
                         main_ddl = result.stdout
-                        print(f"  ✓ Successfully read {len(main_ddl)} bytes from origin/main")
+                        print(f"  SUCCESS: Read {len(main_ddl)} bytes from origin/main")
                     else:
-                        print(f"  ✗ Failed to read from main branch")
+                        print(f"  FAILED: Could not read from main branch")
                         if result.stderr:
                             print(f"  Git error: {result.stderr[:300]}")
                         main_ddl = None
                         
                 except Exception as e:
-                    print(f"  ✗ Exception: {str(e)}")
+                    print(f"  ERROR: {str(e)}")
                     main_ddl = None
                 
                 changes = comparator.compare_tables(main_ddl, current_ddl, sql_file)
@@ -287,7 +276,7 @@ jobs:
             comparator.generate_reports()
             
             print("\n" + "=" * 70)
-            print(f"✓ Comparison Complete: {total_changes} change(s) detected")
+            print(f"Comparison Complete: {total_changes} change(s) detected")
             print("=" * 70)
 
         if __name__ == "__main__":
@@ -343,5 +332,5 @@ jobs:
     
     - name: Pipeline Complete
       run: |
-        echo "✓ Schema comparison completed"
+        echo "Schema comparison completed"
         echo "Branch: ${GITHUB_REF##*/}"
