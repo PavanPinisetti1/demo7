@@ -96,7 +96,7 @@ jobs:
             
             def extract_datatype(self, col_def):
                 """Extract datatype from column definition"""
-                match = re.search(r'(number|varchar2|date|timestamp|clob|blob|char|integer|float|raw)(\([^)]+\))?', col_def, re.IGNORECASE)
+                match = re.search(r'(number|varchar2|date|timestamp|clob|blob|char|integer|float|raw)($$[^)]+$$)?', col_def, re.IGNORECASE)
                 if match:
                     return match.group(0).upper()
                 return None
@@ -424,11 +424,10 @@ jobs:
                         
                         f.write("---\n\n")
                         f.write("## Migration SQL Script\n\n")
-                        f.write("```
+                        f.write("SQL Statements:\n\n")
                         for stmt in self.alter_statements:
-                            f.write(f"{stmt}\n")
-                        f.write("```\n\n")
-                        f.write("---\n\n")
+                            f.write(f"    {stmt}\n")
+                        f.write("\n---\n\n")
                         f.write("**Note:** Please review all changes carefully before applying to production.\n")
                     else:
                         f.write("No schema differences detected.\n")
