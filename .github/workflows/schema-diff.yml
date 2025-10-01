@@ -13,18 +13,27 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout Repository
+    - name: Checkout Current Branch
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # CRITICAL: Fetch all history for all branches
-        ref: ${{ github.ref }}
+        fetch-depth: 0  # Fetch all history
     
-    - name: Fetch Main Branch Explicitly
+    - name: Fetch and Setup Main Branch
       run: |
+        echo "Setting up git configuration..."
+        git config --global user.email "github-actions@github.com"
+        git config --global user.name "GitHub Actions"
+        
         echo "Fetching main branch..."
-        git fetch origin main:main
+        git fetch origin main
+        
+        echo "Available branches:"
         git branch -a
-        echo "Current branch: $(git branch --show-current)"
+        
+        echo "Current branch: $(git rev-parse --abbrev-ref HEAD)"
+        
+        echo "Testing main branch access..."
+        git show origin/main:src/database/wksp_ebs2cloud_migration/tables/test_data.sql || echo "Could not access test_data.sql from main"
     
     - name: Setup Python
       uses: actions/setup-python@v5
@@ -50,7 +59,7 @@ jobs:
             def __init__(self):
                 self.differences = []
                 self.alter_statements = []
-                self.current_branch = os.environ.get('GITHUB_REF', '').split('/')[-1]
+                self.current_branch = os.environ.get('GITHUB_REF_NAME', 'unknown')
                 
             def extract_columns_from_ddl(self, ddl_content):
                 """Extract column definitions from DDL with full details"""
@@ -246,9 +255,9 @@ jobs:
                 print(f"\n  Fetching from main branch: {git_path}")
                 
                 try:
-                    # Try to get file from main branch
+                    # Use origin/main instead of main
                     result = subprocess.run(
-                        ['git', 'show', f'main:{git_path}'],
+                        ['git', 'show', f'origin/main:{git_path}'],
                         capture_output=True,
                         text=True,
                         check=False,
@@ -257,10 +266,11 @@ jobs:
                     
                     if result.returncode == 0 and result.stdout.strip():
                         main_ddl = result.stdout
-                        print(f"  ✓ Successfully read {len(main_ddl)} bytes from main")
+                        print(f"  ✓ Successfully read {len(main_ddl)} bytes from origin/main")
                     else:
                         print(f"  ✗ Failed to read from main branch")
-                        print(f"  Git error: {result.stderr[:300]}")
+                        if result.stderr:
+                            print(f"  Git error: {result.stderr[:300]}")
                         main_ddl = None
                         
                 except Exception as e:
