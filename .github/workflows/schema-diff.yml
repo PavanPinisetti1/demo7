@@ -237,9 +237,8 @@ jobs:
             for sql_file in sql_files:
                 current_ddl = sql_file.read_text()
                 
-                # Get relative path from repo root for git command
-                relative_path = sql_file.relative_to(Path.cwd())
-                git_path = str(relative_path).replace('\\', '/')
+                # Simple approach: use the path relative to where we are
+                git_path = 'src/database/wksp_ebs2cloud_migration/tables/' + sql_file.name
                 
                 print(f"  Attempting to read from main: {git_path}")
                 
@@ -249,8 +248,7 @@ jobs:
                         ['git', 'show', f'main:{git_path}'],
                         capture_output=True,
                         text=True,
-                        check=False,
-                        cwd=Path.cwd()
+                        check=False
                     )
                     
                     if result.returncode == 0:
