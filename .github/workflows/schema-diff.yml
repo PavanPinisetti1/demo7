@@ -56,7 +56,7 @@ jobs:
     # =========================================================================
     - name: 📝 Create Schema Comparison Script
       run: |
-        cat > compare_schemas.py <<'PYTHON_SCRIPT'
+        cat > compare_schemas.py <<'EOF'
 import re
 import os
 from pathlib import Path
@@ -343,8 +343,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-PYTHON_SCRIPT
-        
+EOF
         echo "✓ Comparison script created"
     
     # =========================================================================
