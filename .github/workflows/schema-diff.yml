@@ -237,28 +237,31 @@ jobs:
             for sql_file in sql_files:
                 current_ddl = sql_file.read_text()
                 
+                # Get relative path from repo root for git command
+                relative_path = sql_file.relative_to(Path.cwd())
+                git_path = str(relative_path).replace('\\', '/')
+                
+                print(f"  Attempting to read from main: {git_path}")
+                
                 try:
                     import subprocess
-                    # Convert Path to string for git command
-                    git_path = str(sql_file)
-                    print(f"  Git command: git show main:{git_path}")
-                    
                     result = subprocess.run(
                         ['git', 'show', f'main:{git_path}'],
                         capture_output=True,
                         text=True,
-                        check=False
+                        check=False,
+                        cwd=Path.cwd()
                     )
                     
                     if result.returncode == 0:
                         main_ddl = result.stdout
-                        print(f"  Successfully read main branch file ({len(main_ddl)} bytes)")
+                        print(f"  SUCCESS: Read {len(main_ddl)} bytes from main branch")
                     else:
-                        print(f"  File does not exist in main branch")
-                        print(f"  Git error: {result.stderr}")
+                        print(f"  FAILED: Could not read from main branch")
+                        print(f"  Git stderr: {result.stderr[:200]}")
                         main_ddl = None
                 except Exception as e:
-                    print(f"  Error reading main branch: {e}")
+                    print(f"  ERROR: {e}")
                     main_ddl = None
                 
                 changes = comparator.compare_tables(main_ddl, current_ddl, sql_file)
