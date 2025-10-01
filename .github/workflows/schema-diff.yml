@@ -239,8 +239,12 @@ jobs:
                 
                 try:
                     import subprocess
+                    # Convert Path to string for git command
+                    git_path = str(sql_file)
+                    print(f"  Git command: git show main:{git_path}")
+                    
                     result = subprocess.run(
-                        ['git', 'show', f'main:{sql_file}'],
+                        ['git', 'show', f'main:{git_path}'],
                         capture_output=True,
                         text=True,
                         check=False
@@ -248,11 +252,13 @@ jobs:
                     
                     if result.returncode == 0:
                         main_ddl = result.stdout
+                        print(f"  Successfully read main branch file ({len(main_ddl)} bytes)")
                     else:
-                        print(f"\nFile {sql_file.name} does not exist in main branch")
+                        print(f"  File does not exist in main branch")
+                        print(f"  Git error: {result.stderr}")
                         main_ddl = None
                 except Exception as e:
-                    print(f"\nError reading main branch: {e}")
+                    print(f"  Error reading main branch: {e}")
                     main_ddl = None
                 
                 changes = comparator.compare_tables(main_ddl, current_ddl, sql_file)
