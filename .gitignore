@@ -1,16 +1,5 @@
-# Oracle SQLcl Projects
-artifact/*
-var/*
-*.tar.gz
-*.tz
-*.zip
-*.log
-**/.DS_Store
-# Oracle SQLcl Projects
-artifact/*
-var/*
-*.tar.gz
-*.tz
-*.zip
-*.log
-**/.DS_Store
+conn.ps1
+
+py_script.sh
+
+script.sh
