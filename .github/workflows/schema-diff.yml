@@ -1,22 +1,9 @@
-# =============================================================================
-# AUTOMATED CI/CD PIPELINE FOR APEX SCHEMA VERSION CONTROL
-# Repository: https://github.com/PavanPinisetti1/demo7.git
-# =============================================================================
-# File Location: .github/workflows/schema-diff.yml
-#
-# This pipeline automatically:
-# 1. Triggers when you push to any branch
-# 2. Compares your branch with main branch
-# 3. Generates ALTER scripts for detected differences
-# 4. Creates downloadable artifacts with the migration scripts
-# =============================================================================
-
 name: APEX Schema Auto-Diff Generator
 
 on:
   push:
     branches:
-      - '**'  # Trigger on all branches
+      - '**'
   pull_request:
     branches:
       - main
@@ -26,339 +13,184 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    # =========================================================================
-    # STEP 1: Checkout the repository with full history
-    # =========================================================================
-    - name: 📥 Checkout Repository
+    - name: Checkout Repository
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Get all history for comparison
+        fetch-depth: 0
     
-    # =========================================================================
-    # STEP 2: Setup Python
-    # =========================================================================
-    - name: 🐍 Setup Python
+    - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
     
-    # =========================================================================
-    # STEP 3: Create output directories
-    # =========================================================================
-    - name: 📁 Create Output Directories
+    - name: Create Output Directories
       run: |
         mkdir -p diff-reports
         mkdir -p migration-scripts
-        echo "✓ Directories created"
+        echo "Directories created"
     
-    # =========================================================================
-    # STEP 4: Create the schema comparison script
-    # =========================================================================
-    - name: 📝 Create Schema Comparison Script
+    - name: Create Schema Comparison Script
       run: |
-        cat > compare_schemas.py <<'EOF'
-import re
-import os
-from pathlib import Path
-from datetime import datetime
+        cat > compare_schemas.py << 'ENDOFSCRIPT'
+        import re
+        import os
+        from pathlib import Path
+        from datetime import datetime
 
-class APEXSchemaComparator:
-    """Compare APEX schema DDL files between Git branches"""
-    
-    def __init__(self):
-        self.differences = []
-        self.alter_statements = []
-        self.current_branch = os.environ.get('GITHUB_REF', '').split('/')[-1]
-        
-    def parse_ddl(self, ddl_content):
-        """Parse DDL to extract table structure"""
-        table_info = {
-            'name': None,
-            'columns': {}
-        }
-        
-        # Extract table name
-        table_match = re.search(
-            r'create\s+table\s+(\w+\.\w+|\w+)\s*\(',
-            ddl_content,
-            re.IGNORECASE
-        )
-        if table_match:
-            table_info['name'] = table_match.group(1)
-        
-        # Extract columns with their full definitions
-        # Pattern to match column definitions
-        col_pattern = r'(\w+)\s+(number|varchar2|date|timestamp|clob|blob)(\([^\)]+\))?([^,\n]*?)(?:,|\)|;)'
-        
-        for match in re.finditer(col_pattern, ddl_content, re.IGNORECASE):
-            col_name = match.group(1).strip()
-            col_type = match.group(2).strip().upper()
-            col_size = match.group(3) if match.group(3) else ''
-            col_attrs = match.group(4).strip()
-            
-            # Skip SQL keywords
-            if col_name.upper() in ['CREATE', 'TABLE', 'ALTER', 'ADD', 'DROP', 
-                                     'MODIFY', 'PRIMARY', 'KEY', 'CONSTRAINT',
-                                     'USING', 'INDEX', 'ENABLE', 'DISABLE']:
-                continue
-            
-            full_definition = f"{col_type}{col_size} {col_attrs}".strip()
-            table_info['columns'][col_name.upper()] = full_definition
-        
-        return table_info
-    
-    def compare_tables(self, main_ddl, current_ddl, table_file):
-        """Compare table definitions between branches"""
-        
-        main_info = self.parse_ddl(main_ddl) if main_ddl else {'name': None, 'columns': {}}
-        current_info = self.parse_ddl(current_ddl)
-        
-        table_name = current_info['name'] or main_info['name']
-        if not table_name:
-            table_name = Path(table_file).stem.upper()
-        
-        # Clean table name (remove schema prefix for ALTER statements)
-        simple_table_name = table_name.split('.')[-1] if '.' in table_name else table_name
-        
-        print(f"\n🔍 Analyzing: {simple_table_name}")
-        
-        # Compare columns
-        main_cols = main_info['columns']
-        current_cols = current_info['columns']
-        
-        # Find new columns
-        new_cols = set(current_cols.keys()) - set(main_cols.keys())
-        for col in sorted(new_cols):
-            col_def = current_cols[col]
-            
-            diff_msg = f"Added column '{col}' with definition: {col_def}"
-            self.differences.append({
-                'table': simple_table_name,
-                'type': 'ADD_COLUMN',
-                'message': diff_msg,
-                'column': col,
-                'definition': col_def
-            })
-            
-            # Generate ALTER statement
-            alter_stmt = f"ALTER TABLE {simple_table_name} ADD {col} {col_def};"
-            self.alter_statements.append(alter_stmt)
-            
-            print(f"  ✓ {diff_msg}")
-        
-        # Find dropped columns
-        dropped_cols = set(main_cols.keys()) - set(current_cols.keys())
-        for col in sorted(dropped_cols):
-            diff_msg = f"Dropped column '{col}'"
-            self.differences.append({
-                'table': simple_table_name,
-                'type': 'DROP_COLUMN',
-                'message': diff_msg,
-                'column': col
-            })
-            
-            alter_stmt = f"ALTER TABLE {simple_table_name} DROP COLUMN {col};"
-            self.alter_statements.append(alter_stmt)
-            
-            print(f"  ✓ {diff_msg}")
-        
-        # Find modified columns
-        common_cols = set(current_cols.keys()) & set(main_cols.keys())
-        for col in sorted(common_cols):
-            if current_cols[col] != main_cols[col]:
-                diff_msg = f"Modified column '{col}': {main_cols[col]} → {current_cols[col]}"
-                self.differences.append({
-                    'table': simple_table_name,
-                    'type': 'MODIFY_COLUMN',
-                    'message': diff_msg,
-                    'column': col,
-                    'old_def': main_cols[col],
-                    'new_def': current_cols[col]
-                })
+        class APEXSchemaComparator:
+            def __init__(self):
+                self.differences = []
+                self.alter_statements = []
+                self.current_branch = os.environ.get('GITHUB_REF', '').split('/')[-1]
                 
-                alter_stmt = f"ALTER TABLE {simple_table_name} MODIFY {col} {current_cols[col]};"
-                self.alter_statements.append(alter_stmt)
-                
-                print(f"  ✓ {diff_msg}")
-        
-        return len(new_cols) + len(dropped_cols) + len([c for c in common_cols if current_cols[c] != main_cols[c]])
-    
-    def generate_reports(self):
-        """Generate migration scripts and reports"""
-        
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        branch = self.current_branch
-        
-        # =====================================================================
-        # Generate ALTER Script
-        # =====================================================================
-        alter_file = Path(f"migration-scripts/migrate-{branch}.sql")
-        alter_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(alter_file, 'w') as f:
-            f.write(f"-- =====================================================\n")
-            f.write(f"-- APEX Schema Migration Script\n")
-            f.write(f"-- =====================================================\n")
-            f.write(f"-- Source Branch: main\n")
-            f.write(f"-- Target Branch: {branch}\n")
-            f.write(f"-- Generated: {timestamp}\n")
-            f.write(f"-- Total Changes: {len(self.differences)}\n")
-            f.write(f"-- =====================================================\n\n")
+            def parse_ddl(self, ddl_content):
+                table_info = {'name': None, 'columns': {}}
+                table_match = re.search(r'create\s+table\s+(\w+\.\w+|\w+)\s*\(', ddl_content, re.IGNORECASE)
+                if table_match:
+                    table_info['name'] = table_match.group(1)
+                col_pattern = r'(\w+)\s+(number|varchar2|date|timestamp|clob|blob)(\([^\)]+\))?([^,\n]*?)(?:,|\)|;)'
+                for match in re.finditer(col_pattern, ddl_content, re.IGNORECASE):
+                    col_name = match.group(1).strip()
+                    col_type = match.group(2).strip().upper()
+                    col_size = match.group(3) if match.group(3) else ''
+                    col_attrs = match.group(4).strip()
+                    if col_name.upper() in ['CREATE', 'TABLE', 'ALTER', 'ADD', 'DROP', 'MODIFY', 'PRIMARY', 'KEY', 'CONSTRAINT', 'USING', 'INDEX', 'ENABLE', 'DISABLE']:
+                        continue
+                    full_definition = f"{col_type}{col_size} {col_attrs}".strip()
+                    table_info['columns'][col_name.upper()] = full_definition
+                return table_info
             
-            if self.alter_statements:
-                f.write("-- Run this script to migrate from main to {}\n\n".format(branch))
-                for stmt in self.alter_statements:
-                    f.write(f"{stmt}\n")
-                f.write(f"\n-- End of migration script\n")
-            else:
-                f.write("-- No schema changes detected\n")
-        
-        print(f"\n✅ Migration script: {alter_file}")
-        
-        # =====================================================================
-        # Generate Markdown Summary
-        # =====================================================================
-        summary_file = Path(f"diff-reports/summary-{branch}.md")
-        summary_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(summary_file, 'w') as f:
-            f.write(f"# Schema Changes: main → {branch}\n\n")
-            f.write(f"**Generated:** {timestamp}\n\n")
-            f.write(f"**Repository:** https://github.com/PavanPinisetti1/demo7.git\n\n")
-            f.write(f"**Total Changes:** {len(self.differences)}\n\n")
-            f.write(f"---\n\n")
+            def compare_tables(self, main_ddl, current_ddl, table_file):
+                main_info = self.parse_ddl(main_ddl) if main_ddl else {'name': None, 'columns': {}}
+                current_info = self.parse_ddl(current_ddl)
+                table_name = current_info['name'] or main_info['name']
+                if not table_name:
+                    table_name = Path(table_file).stem.upper()
+                simple_table_name = table_name.split('.')[-1] if '.' in table_name else table_name
+                print(f"\nAnalyzing: {simple_table_name}")
+                main_cols = main_info['columns']
+                current_cols = current_info['columns']
+                new_cols = set(current_cols.keys()) - set(main_cols.keys())
+                for col in sorted(new_cols):
+                    col_def = current_cols[col]
+                    diff_msg = f"Added column '{col}' with definition: {col_def}"
+                    self.differences.append({'table': simple_table_name, 'type': 'ADD_COLUMN', 'message': diff_msg, 'column': col, 'definition': col_def})
+                    alter_stmt = f"ALTER TABLE {simple_table_name} ADD {col} {col_def};"
+                    self.alter_statements.append(alter_stmt)
+                    print(f"  Added: {col}")
+                dropped_cols = set(main_cols.keys()) - set(current_cols.keys())
+                for col in sorted(dropped_cols):
+                    diff_msg = f"Dropped column '{col}'"
+                    self.differences.append({'table': simple_table_name, 'type': 'DROP_COLUMN', 'message': diff_msg, 'column': col})
+                    alter_stmt = f"ALTER TABLE {simple_table_name} DROP COLUMN {col};"
+                    self.alter_statements.append(alter_stmt)
+                    print(f"  Dropped: {col}")
+                common_cols = set(current_cols.keys()) & set(main_cols.keys())
+                for col in sorted(common_cols):
+                    if current_cols[col] != main_cols[col]:
+                        diff_msg = f"Modified column '{col}': {main_cols[col]} -> {current_cols[col]}"
+                        self.differences.append({'table': simple_table_name, 'type': 'MODIFY_COLUMN', 'message': diff_msg, 'column': col, 'old_def': main_cols[col], 'new_def': current_cols[col]})
+                        alter_stmt = f"ALTER TABLE {simple_table_name} MODIFY {col} {current_cols[col]};"
+                        self.alter_statements.append(alter_stmt)
+                        print(f"  Modified: {col}")
+                return len(new_cols) + len(dropped_cols) + len([c for c in common_cols if current_cols[c] != main_cols[c]])
             
-            if self.differences:
-                # Group by table
-                tables = {}
-                for diff in self.differences:
-                    table = diff['table']
-                    if table not in tables:
-                        tables[table] = []
-                    tables[table].append(diff)
-                
-                f.write("## 📊 Changes by Table\n\n")
-                for table, changes in tables.items():
-                    f.write(f"### Table: `{table}`\n\n")
-                    for change in changes:
-                        f.write(f"- **{change['type']}**: {change['message']}\n")
-                    f.write("\n")
-                
-                f.write("---\n\n")
-                f.write("## 🔧 Migration SQL Script\n\n")
-                f.write("```sql\n")
-                for stmt in self.alter_statements:
-                    f.write(f"{stmt}\n")
-                f.write("```\n\n")
-                
-                f.write("---\n\n")
-                f.write("## 📥 How to Apply\n\n")
-                f.write("1. Download the migration script from artifacts\n")
-                f.write(f"2. Review the changes in `migrate-{branch}.sql`\n")
-                f.write("3. Run the script in your APEX SQL Workshop:\n")
-                f.write("   ```sql\n")
-                f.write(f"   @migrate-{branch}.sql\n")
-                f.write("   ```\n")
-            else:
-                f.write("✅ **No schema differences detected.**\n\n")
-                f.write(f"The schema in branch `{branch}` is identical to `main`.\n")
-        
-        print(f"✅ Summary report: {summary_file}")
-        
-        return len(self.differences)
+            def generate_reports(self):
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                branch = self.current_branch
+                alter_file = Path(f"migration-scripts/migrate-{branch}.sql")
+                alter_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(alter_file, 'w') as f:
+                    f.write(f"-- APEX Schema Migration Script\n")
+                    f.write(f"-- Source Branch: main\n")
+                    f.write(f"-- Target Branch: {branch}\n")
+                    f.write(f"-- Generated: {timestamp}\n")
+                    f.write(f"-- Total Changes: {len(self.differences)}\n\n")
+                    if self.alter_statements:
+                        for stmt in self.alter_statements:
+                            f.write(f"{stmt}\n")
+                    else:
+                        f.write("-- No schema changes detected\n")
+                print(f"\nMigration script: {alter_file}")
+                summary_file = Path(f"diff-reports/summary-{branch}.md")
+                summary_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(summary_file, 'w') as f:
+                    f.write(f"# Schema Changes: main -> {branch}\n\n")
+                    f.write(f"**Generated:** {timestamp}\n\n")
+                    f.write(f"**Total Changes:** {len(self.differences)}\n\n")
+                    if self.differences:
+                        tables = {}
+                        for diff in self.differences:
+                            table = diff['table']
+                            if table not in tables:
+                                tables[table] = []
+                            tables[table].append(diff)
+                        f.write("## Changes by Table\n\n")
+                        for table, changes in tables.items():
+                            f.write(f"### Table: `{table}`\n\n")
+                            for change in changes:
+                                f.write(f"- **{change['type']}**: {change['message']}\n")
+                            f.write("\n")
+                        f.write("## Migration SQL Script\n\n```sql\n")
+                        for stmt in self.alter_statements:
+                            f.write(f"{stmt}\n")
+                        f.write("```\n")
+                    else:
+                        f.write("No schema differences detected.\n")
+                print(f"Summary report: {summary_file}")
+                return len(self.differences)
 
-def main():
-    """Main execution"""
-    print("=" * 70)
-    print("🚀 APEX Schema Comparison Tool")
-    print("=" * 70)
-    
-    comparator = APEXSchemaComparator()
-    
-    # Get current branch
-    current_branch = comparator.current_branch
-    print(f"\n📍 Current Branch: {current_branch}")
-    
-    if current_branch == 'main':
-        print("\n✅ On main branch - no comparison needed")
-        return
-    
-    # Path to schema files
-    schema_path = Path("src/database/wksp_ebs2cloud_migration/tables")
-    
-    if not schema_path.exists():
-        print(f"\n❌ Schema path not found: {schema_path}")
-        return
-    
-    print(f"📂 Schema Path: {schema_path}")
-    
-    # Get all SQL files in current branch
-    sql_files = list(schema_path.glob("*.sql"))
-    
-    if not sql_files:
-        print(f"\n❌ No SQL files found in {schema_path}")
-        return
-    
-    print(f"📄 Found {len(sql_files)} SQL file(s)")
-    
-    total_changes = 0
-    
-    # Compare each file
-    for sql_file in sql_files:
-        # Read current branch file
-        current_ddl = sql_file.read_text()
-        
-        # Get the same file from main branch
-        try:
-            import subprocess
-            result = subprocess.run(
-                ['git', 'show', f'main:{sql_file}'],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode == 0:
-                main_ddl = result.stdout
-            else:
-                print(f"\n⚠️  File {sql_file.name} doesn't exist in main branch (new table)")
-                main_ddl = None
-        except Exception as e:
-            print(f"\n❌ Error reading main branch: {e}")
-            main_ddl = None
-        
-        # Compare
-        changes = comparator.compare_tables(main_ddl, current_ddl, sql_file)
-        total_changes += changes
-    
-    # Generate reports
-    print("\n" + "=" * 70)
-    print("📝 Generating Reports...")
-    print("=" * 70)
-    
-    comparator.generate_reports()
-    
-    print("\n" + "=" * 70)
-    print(f"✅ Comparison Complete: {total_changes} change(s) detected")
-    print("=" * 70)
+        def main():
+            print("APEX Schema Comparison Tool")
+            comparator = APEXSchemaComparator()
+            current_branch = comparator.current_branch
+            print(f"Current Branch: {current_branch}")
+            if current_branch == 'main':
+                print("On main branch - no comparison needed")
+                return
+            schema_path = Path("src/database/wksp_ebs2cloud_migration/tables")
+            if not schema_path.exists():
+                print(f"Schema path not found: {schema_path}")
+                return
+            print(f"Schema Path: {schema_path}")
+            sql_files = list(schema_path.glob("*.sql"))
+            if not sql_files:
+                print(f"No SQL files found in {schema_path}")
+                return
+            print(f"Found {len(sql_files)} SQL file(s)")
+            total_changes = 0
+            for sql_file in sql_files:
+                current_ddl = sql_file.read_text()
+                try:
+                    import subprocess
+                    result = subprocess.run(['git', 'show', f'main:{sql_file}'], capture_output=True, text=True)
+                    if result.returncode == 0:
+                        main_ddl = result.stdout
+                    else:
+                        print(f"File {sql_file.name} doesn't exist in main branch")
+                        main_ddl = None
+                except Exception as e:
+                    print(f"Error reading main branch: {e}")
+                    main_ddl = None
+                changes = comparator.compare_tables(main_ddl, current_ddl, sql_file)
+                total_changes += changes
+            print("Generating Reports...")
+            comparator.generate_reports()
+            print(f"Comparison Complete: {total_changes} change(s) detected")
 
-if __name__ == "__main__":
-    main()
-EOF
-        echo "✓ Comparison script created"
+        if __name__ == "__main__":
+            main()
+        ENDOFSCRIPT
+        
+        echo "Comparison script created"
     
-    # =========================================================================
-    # STEP 5: Run the comparison (skip if on main branch)
-    # =========================================================================
-    - name: 🔍 Compare Schemas
+    - name: Compare Schemas
       if: github.ref != 'refs/heads/main'
       run: |
         echo "Starting schema comparison..."
         python3 compare_schemas.py
     
-    # =========================================================================
-    # STEP 6: Upload artifacts (ALTER scripts and reports)
-    # =========================================================================
-    - name: 📤 Upload Migration Scripts
+    - name: Upload Migration Scripts
       if: github.ref != 'refs/heads/main'
       uses: actions/upload-artifact@v4
       with:
@@ -368,25 +200,18 @@ EOF
           diff-reports/
         retention-days: 90
     
-    # =========================================================================
-    # STEP 7: Add summary to GitHub Actions UI
-    # =========================================================================
-    - name: 📋 Create GitHub Actions Summary
+    - name: Create GitHub Actions Summary
       if: github.ref != 'refs/heads/main'
       run: |
         BRANCH_NAME=${GITHUB_REF##*/}
-        
         if [ -f "diff-reports/summary-${BRANCH_NAME}.md" ]; then
           cat "diff-reports/summary-${BRANCH_NAME}.md" >> $GITHUB_STEP_SUMMARY
         else
-          echo "## ℹ️ No Changes" >> $GITHUB_STEP_SUMMARY
+          echo "## No Changes" >> $GITHUB_STEP_SUMMARY
           echo "Schema in **${BRANCH_NAME}** matches **main**" >> $GITHUB_STEP_SUMMARY
         fi
     
-    # =========================================================================
-    # STEP 8: Comment on Pull Request (if PR)
-    # =========================================================================
-    - name: 💬 Comment on Pull Request
+    - name: Comment on Pull Request
       if: github.event_name == 'pull_request'
       uses: actions/github-script@v7
       with:
@@ -394,86 +219,17 @@ EOF
           const fs = require('fs');
           const branchName = context.payload.pull_request.head.ref;
           const summaryPath = `diff-reports/summary-${branchName}.md`;
-          
           if (fs.existsSync(summaryPath)) {
             const summary = fs.readFileSync(summaryPath, 'utf8');
-            
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## 🔄 Schema Changes Detected\n\n${summary}\n\n---\n📥 Download migration scripts from workflow artifacts.`
+              body: `## Schema Changes Detected\n\n${summary}\n\nDownload migration scripts from workflow artifacts.`
             });
           }
     
-    # =========================================================================
-    # STEP 9: Success notification
-    # =========================================================================
-    - name: ✅ Pipeline Complete
+    - name: Pipeline Complete
       run: |
-        echo ""
-        echo "============================================"
-        echo "✅ Schema comparison completed!"
-        echo "============================================"
-        echo ""
+        echo "Schema comparison completed!"
         echo "Branch: ${GITHUB_REF##*/}"
-        echo ""
-        if [ "${GITHUB_REF##*/}" != "main" ]; then
-          echo "📥 Download artifacts to get:"
-          echo "  • ALTER migration scripts"
-          echo "  • Detailed change reports"
-        fi
-        echo ""
-        echo "============================================"
-
-# =============================================================================
-# SETUP INSTRUCTIONS
-# =============================================================================
-#
-# 1. In your repository, create this file at:
-#    .github/workflows/schema-diff.yml
-#
-# 2. Your current structure is already perfect:
-#    demo7/
-#    ├── .github/
-#    │   └── workflows/
-#    │       └── schema-diff.yml  ← Create this file
-#    └── src/
-#        └── database/
-#            └── wksp_ebs2cloud_migration/
-#                └── tables/
-#                    └── test_data.sql  ← Your schema file
-#
-# 3. That's it! The pipeline will automatically run when you push.
-#
-# =============================================================================
-# USAGE
-# =============================================================================
-#
-# The pipeline triggers automatically when you:
-# • Push to any branch: git push origin v1.1
-# • Create a pull request to main
-#
-# What you get:
-# • Automatic detection of schema changes
-# • Ready-to-run ALTER scripts
-# • Downloadable artifacts with migration files
-#
-# Example for your case:
-# When you push v1.1 branch, it will generate:
-#   migration-scripts/migrate-v1.1.sql containing:
-#   ALTER TABLE TEST_DATA ADD FLAG VARCHAR2(3 BYTE);
-#
-# =============================================================================
-# WHERE TO FIND OUTPUT
-# =============================================================================
-#
-# 1. Go to: https://github.com/PavanPinisetti1/demo7/actions
-# 2. Click on the latest workflow run
-# 3. Scroll to "Artifacts" section
-# 4. Download "migration-scripts-v1.1"
-# 5. Inside you'll find:
-#    • migrate-v1.1.sql (your ALTER script)
-#    • summary-v1.1.md (readable report)
-#
-# =============================================================================
