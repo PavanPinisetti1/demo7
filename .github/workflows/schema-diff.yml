@@ -43,14 +43,16 @@ jobs:
         mkdir -p migration-scripts
         echo "Directories created"
     
-    - name: Create Schema Comparison Script
+    - name: Create Complete Schema Comparison Script
       run: |
         cat > compare_schemas.py << 'ENDCOMPARE'
         import re
         import os
+        import hashlib
         from pathlib import Path
         from datetime import datetime
         import subprocess
+
 
         class APEXSchemaComparator:
             def __init__(self):
@@ -59,7 +61,7 @@ jobs:
                 self.current_branch = os.environ.get('GITHUB_REF_NAME', 'unknown')
                 
             def extract_columns_from_ddl(self, ddl_content):
-                """Extract column definitions from DDL with full details"""
+                """Extract column definitions with full details"""
                 columns = {}
                 in_create = False
                 lines = ddl_content.split('\n')
@@ -79,44 +81,106 @@ jobs:
                             line_stripped.startswith('/')):
                             break
                         
-                        match = re.match(r'^(\w+)\s+(number|varchar2|date|timestamp|clob|blob|char)', line_stripped, re.IGNORECASE)
+                        match = re.match(r'^(\w+)\s+(number|varchar2|date|timestamp|clob|blob|char|integer|float|raw)', line_stripped, re.IGNORECASE)
                         if match:
                             col_name = match.group(1).upper()
                             col_def = line_stripped.rstrip(',').strip()
-                            columns[col_name] = col_def
+                            columns[col_name] = {
+                                'definition': col_def,
+                                'datatype': self.extract_datatype(col_def),
+                                'nullable': 'not null' not in col_def.lower(),
+                                'default': self.extract_default(col_def)
+                            }
                 
                 return columns
+            
+            def extract_datatype(self, col_def):
+                """Extract datatype from column definition"""
+                match = re.search(r'(number|varchar2|date|timestamp|clob|blob|char|integer|float|raw)(\([^)]+\))?', col_def, re.IGNORECASE)
+                if match:
+                    return match.group(0).upper()
+                return None
+            
+            def extract_default(self, col_def):
+                """Extract default value from column definition"""
+                match = re.search(r'default\s+(\S+)', col_def, re.IGNORECASE)
+                if match:
+                    return match.group(1)
+                return None
+            
+            def extract_constraints(self, ddl_content):
+                """Extract table-level constraints"""
+                constraints = {}
+                lines = ddl_content.split('\n')
+                
+                for line in lines:
+                    line_stripped = line.strip()
+                    
+                    if 'constraint' in line_stripped.lower():
+                        match = re.search(r'constraint\s+(\w+)', line_stripped, re.IGNORECASE)
+                        if match:
+                            constraint_name = match.group(1).upper()
+                            constraints[constraint_name] = line_stripped.rstrip(',').strip()
+                
+                return constraints
+            
+            def extract_indexes(self, ddl_content):
+                """Extract index definitions"""
+                indexes = {}
+                lines = ddl_content.split('\n')
+                
+                for line in lines:
+                    if 'create index' in line.lower() or 'create unique index' in line.lower():
+                        match = re.search(r'create\s+(unique\s+)?index\s+(\w+)', line, re.IGNORECASE)
+                        if match:
+                            index_name = match.group(2).upper()
+                            indexes[index_name] = line.strip()
+                
+                return indexes
+            
+            def compute_hash(self, content):
+                """Compute MD5 hash of content"""
+                return hashlib.md5(content.encode('utf-8')).hexdigest()
             
             def compare_tables(self, main_ddl, current_ddl, table_file):
                 """Compare table definitions between branches"""
                 table_name = Path(table_file).stem.upper()
                 print(f"\n{'='*70}")
-                print(f"Analyzing table: {table_name}")
+                print(f"Analyzing TABLE: {table_name}")
                 print(f"{'='*70}")
                 
                 if main_ddl:
                     print("SUCCESS: Read from MAIN branch")
                     main_cols = self.extract_columns_from_ddl(main_ddl)
+                    main_constraints = self.extract_constraints(main_ddl)
+                    main_indexes = self.extract_indexes(main_ddl)
                     print(f"  Columns in MAIN: {sorted(main_cols.keys())}")
                 else:
                     main_cols = {}
+                    main_constraints = {}
+                    main_indexes = {}
                     print("WARNING: Could not read from MAIN branch (treating as new table)")
                 
                 current_cols = self.extract_columns_from_ddl(current_ddl)
+                current_constraints = self.extract_constraints(current_ddl)
+                current_indexes = self.extract_indexes(current_ddl)
                 print(f"  Columns in CURRENT ({self.current_branch}): {sorted(current_cols.keys())}")
                 
                 new_cols = set(current_cols.keys()) - set(main_cols.keys())
                 dropped_cols = set(main_cols.keys()) - set(current_cols.keys())
+                common_cols = set(main_cols.keys()) & set(current_cols.keys())
                 
                 print(f"\n  Changes detected:")
                 print(f"    Added: {sorted(new_cols) if new_cols else 'None'}")
                 print(f"    Dropped: {sorted(dropped_cols) if dropped_cols else 'None'}")
                 
+                # ADD COLUMN
                 for col in sorted(new_cols):
-                    col_def = current_cols[col]
+                    col_def = current_cols[col]['definition']
                     diff_msg = f"Added column '{col}'"
                     self.differences.append({
-                        'table': table_name,
+                        'object': table_name,
+                        'object_type': 'TABLE',
                         'type': 'ADD_COLUMN',
                         'message': diff_msg,
                         'column': col,
@@ -124,21 +188,244 @@ jobs:
                     })
                     alter_stmt = f"ALTER TABLE {table_name} ADD {col_def};"
                     self.alter_statements.append(alter_stmt)
-                    print(f"    [+] {col}")
+                    print(f"    [+] ADD: {col}")
                 
+                # DROP COLUMN
                 for col in sorted(dropped_cols):
                     diff_msg = f"Dropped column '{col}'"
                     self.differences.append({
-                        'table': table_name,
+                        'object': table_name,
+                        'object_type': 'TABLE',
                         'type': 'DROP_COLUMN',
                         'message': diff_msg,
                         'column': col
                     })
                     alter_stmt = f"ALTER TABLE {table_name} DROP COLUMN {col};"
                     self.alter_statements.append(alter_stmt)
-                    print(f"    [-] {col}")
+                    print(f"    [-] DROP: {col}")
                 
-                return len(new_cols) + len(dropped_cols)
+                # MODIFY COLUMN
+                for col in common_cols:
+                    main_col = main_cols[col]
+                    current_col = current_cols[col]
+                    
+                    if main_col['datatype'] != current_col['datatype']:
+                        diff_msg = f"Modified column '{col}' datatype from {main_col['datatype']} to {current_col['datatype']}"
+                        self.differences.append({
+                            'object': table_name,
+                            'object_type': 'TABLE',
+                            'type': 'MODIFY_COLUMN',
+                            'message': diff_msg,
+                            'column': col
+                        })
+                        alter_stmt = f"ALTER TABLE {table_name} MODIFY {col} {current_col['datatype']};"
+                        self.alter_statements.append(alter_stmt)
+                        print(f"    [~] MODIFY: {col} datatype")
+                    
+                    if main_col['nullable'] != current_col['nullable']:
+                        null_status = "NULL" if current_col['nullable'] else "NOT NULL"
+                        diff_msg = f"Modified column '{col}' nullable constraint to {null_status}"
+                        self.differences.append({
+                            'object': table_name,
+                            'object_type': 'TABLE',
+                            'type': 'MODIFY_COLUMN',
+                            'message': diff_msg,
+                            'column': col
+                        })
+                        alter_stmt = f"ALTER TABLE {table_name} MODIFY {col} {null_status};"
+                        self.alter_statements.append(alter_stmt)
+                        print(f"    [~] MODIFY: {col} nullable")
+                    
+                    if main_col['default'] != current_col['default']:
+                        diff_msg = f"Modified column '{col}' default value from {main_col['default']} to {current_col['default']}"
+                        self.differences.append({
+                            'object': table_name,
+                            'object_type': 'TABLE',
+                            'type': 'MODIFY_COLUMN',
+                            'message': diff_msg,
+                            'column': col
+                        })
+                        if current_col['default']:
+                            alter_stmt = f"ALTER TABLE {table_name} MODIFY {col} DEFAULT {current_col['default']};"
+                        else:
+                            alter_stmt = f"ALTER TABLE {table_name} MODIFY {col} DEFAULT NULL;"
+                        self.alter_statements.append(alter_stmt)
+                        print(f"    [~] MODIFY: {col} default")
+                
+                # ADD CONSTRAINT
+                new_constraints = set(current_constraints.keys()) - set(main_constraints.keys())
+                for constraint in sorted(new_constraints):
+                    constraint_def = current_constraints[constraint]
+                    diff_msg = f"Added constraint '{constraint}'"
+                    self.differences.append({
+                        'object': table_name,
+                        'object_type': 'TABLE',
+                        'type': 'ADD_CONSTRAINT',
+                        'message': diff_msg,
+                        'constraint': constraint
+                    })
+                    alter_stmt = f"ALTER TABLE {table_name} ADD {constraint_def};"
+                    self.alter_statements.append(alter_stmt)
+                    print(f"    [+] ADD CONSTRAINT: {constraint}")
+                
+                # DROP CONSTRAINT
+                dropped_constraints = set(main_constraints.keys()) - set(current_constraints.keys())
+                for constraint in sorted(dropped_constraints):
+                    diff_msg = f"Dropped constraint '{constraint}'"
+                    self.differences.append({
+                        'object': table_name,
+                        'object_type': 'TABLE',
+                        'type': 'DROP_CONSTRAINT',
+                        'message': diff_msg,
+                        'constraint': constraint
+                    })
+                    alter_stmt = f"ALTER TABLE {table_name} DROP CONSTRAINT {constraint};"
+                    self.alter_statements.append(alter_stmt)
+                    print(f"    [-] DROP CONSTRAINT: {constraint}")
+                
+                # ADD INDEX
+                new_indexes = set(current_indexes.keys()) - set(main_indexes.keys())
+                for index in sorted(new_indexes):
+                    index_def = current_indexes[index]
+                    diff_msg = f"Added index '{index}'"
+                    self.differences.append({
+                        'object': table_name,
+                        'object_type': 'TABLE',
+                        'type': 'ADD_INDEX',
+                        'message': diff_msg,
+                        'index': index
+                    })
+                    alter_stmt = f"{index_def};"
+                    self.alter_statements.append(alter_stmt)
+                    print(f"    [+] ADD INDEX: {index}")
+                
+                # DROP INDEX
+                dropped_indexes = set(main_indexes.keys()) - set(current_indexes.keys())
+                for index in sorted(dropped_indexes):
+                    diff_msg = f"Dropped index '{index}'"
+                    self.differences.append({
+                        'object': table_name,
+                        'object_type': 'TABLE',
+                        'type': 'DROP_INDEX',
+                        'message': diff_msg,
+                        'index': index
+                    })
+                    alter_stmt = f"DROP INDEX {index};"
+                    self.alter_statements.append(alter_stmt)
+                    print(f"    [-] DROP INDEX: {index}")
+            
+            def compare_plsql_object(self, main_content, current_content, object_file, object_type):
+                """Compare PL/SQL objects (procedures, functions, packages, views, triggers)"""
+                object_name = Path(object_file).stem.upper()
+                print(f"\n{'='*70}")
+                print(f"Analyzing {object_type}: {object_name}")
+                print(f"{'='*70}")
+                
+                if not main_content and current_content:
+                    # NEW OBJECT
+                    diff_msg = f"New {object_type.lower()} created"
+                    self.differences.append({
+                        'object': object_name,
+                        'object_type': object_type,
+                        'type': 'CREATE',
+                        'message': diff_msg
+                    })
+                    self.alter_statements.append(f"-- NEW {object_type}: {object_name}")
+                    self.alter_statements.append(current_content.strip())
+                    self.alter_statements.append("/")
+                    print(f"  [+] CREATE: New {object_type.lower()}")
+                
+                elif main_content and not current_content:
+                    # DROPPED OBJECT
+                    diff_msg = f"{object_type} dropped"
+                    self.differences.append({
+                        'object': object_name,
+                        'object_type': object_type,
+                        'type': 'DROP',
+                        'message': diff_msg
+                    })
+                    drop_cmd = self.get_drop_command(object_name, object_type)
+                    self.alter_statements.append(f"-- DROPPED {object_type}: {object_name}")
+                    self.alter_statements.append(drop_cmd)
+                    print(f"  [-] DROP: {object_type.lower()} removed")
+                
+                elif main_content and current_content:
+                    # COMPARE CONTENT
+                    main_hash = self.compute_hash(main_content)
+                    current_hash = self.compute_hash(current_content)
+                    
+                    if main_hash != current_hash:
+                        diff_msg = f"{object_type} modified"
+                        self.differences.append({
+                            'object': object_name,
+                            'object_type': object_type,
+                            'type': 'REPLACE',
+                            'message': diff_msg
+                        })
+                        self.alter_statements.append(f"-- MODIFIED {object_type}: {object_name}")
+                        self.alter_statements.append(current_content.strip())
+                        self.alter_statements.append("/")
+                        print(f"  [~] REPLACE: {object_type.lower()} modified")
+                    else:
+                        print(f"  [=] No changes detected")
+            
+            def get_drop_command(self, object_name, object_type):
+                """Generate appropriate DROP command for object type"""
+                if object_type == 'PACKAGE':
+                    return f"DROP PACKAGE {object_name};"
+                elif object_type == 'PROCEDURE':
+                    return f"DROP PROCEDURE {object_name};"
+                elif object_type == 'FUNCTION':
+                    return f"DROP FUNCTION {object_name};"
+                elif object_type == 'VIEW':
+                    return f"DROP VIEW {object_name};"
+                elif object_type == 'TRIGGER':
+                    return f"DROP TRIGGER {object_name};"
+                else:
+                    return f"-- DROP {object_type} {object_name};"
+            
+            def process_object_directory(self, directory_path, object_type):
+                """Process all SQL files in a directory for a specific object type"""
+                if not directory_path.exists():
+                    print(f"\nDirectory not found: {directory_path}")
+                    return
+                
+                print(f"\n{'='*70}")
+                print(f"Processing {object_type}S")
+                print(f"{'='*70}")
+                
+                sql_files = list(directory_path.glob("*.sql"))
+                
+                if not sql_files:
+                    print(f"No {object_type.lower()} files found")
+                    return
+                
+                print(f"Found {len(sql_files)} {object_type.lower()} file(s)")
+                
+                for sql_file in sql_files:
+                    current_content = sql_file.read_text()
+                    
+                    git_path = str(sql_file).replace(os.getcwd() + '/', '')
+                    
+                    try:
+                        result = subprocess.run(
+                            ['git', 'show', f'origin/main:{git_path}'],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            cwd=os.getcwd()
+                        )
+                        
+                        if result.returncode == 0 and result.stdout.strip():
+                            main_content = result.stdout
+                        else:
+                            main_content = None
+                            
+                    except Exception as e:
+                        print(f"  ERROR: {str(e)}")
+                        main_content = None
+                    
+                    self.compare_plsql_object(main_content, current_content, sql_file, object_type)
             
             def generate_reports(self):
                 """Generate migration scripts and reports"""
@@ -150,7 +437,7 @@ jobs:
                 
                 with open(alter_file, 'w') as f:
                     f.write(f"-- =====================================================\n")
-                    f.write(f"-- APEX Schema Migration Script\n")
+                    f.write(f"-- APEX Complete Schema Migration Script\n")
                     f.write(f"-- =====================================================\n")
                     f.write(f"-- Source Branch: main\n")
                     f.write(f"-- Target Branch: {branch}\n")
@@ -162,6 +449,7 @@ jobs:
                         f.write(f"-- Run this script to migrate from main to {branch}\n\n")
                         for stmt in self.alter_statements:
                             f.write(f"{stmt}\n")
+                        f.write(f"\nCOMMIT;\n")
                         f.write(f"\n-- End of migration script\n")
                     else:
                         f.write("-- No schema changes detected\n")
@@ -172,32 +460,40 @@ jobs:
                 summary_file.parent.mkdir(parents=True, exist_ok=True)
                 
                 with open(summary_file, 'w') as f:
-                    f.write(f"# Schema Changes: main to {branch}\n\n")
+                    f.write(f"# Complete Schema Changes: main to {branch}\n\n")
                     f.write(f"**Generated:** {timestamp}\n\n")
                     f.write(f"**Total Changes:** {len(self.differences)}\n\n")
-                    f.write(f"---\n\n")
                     
                     if self.differences:
-                        tables = {}
+                        change_types = {}
                         for diff in self.differences:
-                            table = diff['table']
-                            if table not in tables:
-                                tables[table] = []
-                            tables[table].append(diff)
+                            change_type = diff['type']
+                            if change_type not in change_types:
+                                change_types[change_type] = 0
+                            change_types[change_type] += 1
                         
-                        f.write("## Changes by Table\n\n")
-                        for table, changes in tables.items():
-                            f.write(f"### Table: {table}\n\n")
+                        f.write("## Change Summary\n\n")
+                        for change_type, count in sorted(change_types.items()):
+                            f.write(f"- {change_type}: {count}\n")
+                        f.write("\n---\n\n")
+                        
+                        objects_by_type = {}
+                        for diff in self.differences:
+                            obj_type = diff['object_type']
+                            if obj_type not in objects_by_type:
+                                objects_by_type[obj_type] = []
+                            objects_by_type[obj_type].append(diff)
+                        
+                        f.write("## Changes by Object Type\n\n")
+                        for obj_type, changes in sorted(objects_by_type.items()):
+                            f.write(f"### {obj_type}S\n\n")
                             for change in changes:
-                                f.write(f"- {change['type']}: {change['message']}\n")
+                                f.write(f"- **{change['object']}**: {change['type']} - {change['message']}\n")
                             f.write("\n")
                         
                         f.write("---\n\n")
                         f.write("## Migration SQL Script\n\n")
-                        f.write("SQL Format:\n\n")
-                        for stmt in self.alter_statements:
-                            f.write(f"    {stmt}\n")
-                        f.write("\n")
+                        f.write("See migration-scripts folder for complete SQL file\n\n")
                     else:
                         f.write("No schema differences detected.\n")
                         f.write(f"The schema in branch {branch} is identical to main.\n")
@@ -205,9 +501,10 @@ jobs:
                 print(f"Summary report created: {summary_file}")
                 return len(self.differences)
 
+
         def main():
             print("=" * 70)
-            print("APEX Schema Comparison Tool")
+            print("APEX Complete Schema Comparison Tool")
             print("=" * 70)
             
             comparator = APEXSchemaComparator()
@@ -219,55 +516,58 @@ jobs:
                 print("\nOn main branch - no comparison needed")
                 return
             
-            schema_path = Path("src/database/wksp_ebs2cloud_migration/tables")
+            base_path = Path("src/database/wksp_ebs2cloud_migration")
             
-            if not schema_path.exists():
-                print(f"\nSchema path not found: {schema_path}")
+            if not base_path.exists():
+                print(f"\nBase path not found: {base_path}")
                 return
             
-            print(f"Schema Path: {schema_path}")
+            print(f"Base Path: {base_path}")
             
-            sql_files = list(schema_path.glob("*.sql"))
-            
-            if not sql_files:
-                print(f"\nNo SQL files found in {schema_path}")
-                return
-            
-            print(f"Found {len(sql_files)} SQL file(s)")
-            
-            total_changes = 0
-            
-            for sql_file in sql_files:
-                current_ddl = sql_file.read_text()
-                
-                git_path = f'src/database/wksp_ebs2cloud_migration/tables/{sql_file.name}'
-                
-                print(f"\nFetching from main branch: {git_path}")
-                
-                try:
-                    result = subprocess.run(
-                        ['git', 'show', f'origin/main:{git_path}'],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        cwd=os.getcwd()
-                    )
-                    
-                    if result.returncode == 0 and result.stdout.strip():
-                        main_ddl = result.stdout
-                        print(f"  SUCCESS: Read {len(main_ddl)} bytes from origin/main")
-                    else:
-                        print(f"  FAILED: Could not read from main branch")
-                        if result.stderr:
-                            print(f"  Git error: {result.stderr[:300]}")
-                        main_ddl = None
+            # Process Tables
+            tables_path = base_path / "tables"
+            if tables_path.exists():
+                sql_files = list(tables_path.glob("*.sql"))
+                if sql_files:
+                    print(f"\nFound {len(sql_files)} table file(s)")
+                    for sql_file in sql_files:
+                        current_ddl = sql_file.read_text()
+                        git_path = f'src/database/wksp_ebs2cloud_migration/tables/{sql_file.name}'
                         
-                except Exception as e:
-                    print(f"  ERROR: {str(e)}")
-                    main_ddl = None
-                
-                changes = comparator.compare_tables(main_ddl, current_ddl, sql_file)
-                total_changes += changes
+                        try:
+                            result = subprocess.run(
+                                ['git', 'show', f'origin/main:{git_path}'],
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                                cwd=os.getcwd()
+                            )
+                            
+                            if result.returncode == 0 and result.stdout.strip():
+                                main_ddl = result.stdout
+                            else:
+                                main_ddl = None
+                                
+                        except Exception as e:
+                            print(f"  ERROR: {str(e)}")
+                            main_ddl = None
+                        
+                        comparator.compare_tables(main_ddl, current_ddl, sql_file)
+            
+            # Process Procedures
+            comparator.process_object_directory(base_path / "procedures", "PROCEDURE")
+            
+            # Process Functions
+            comparator.process_object_directory(base_path / "functions", "FUNCTION")
+            
+            # Process Packages
+            comparator.process_object_directory(base_path / "packages", "PACKAGE")
+            
+            # Process Views
+            comparator.process_object_directory(base_path / "views", "VIEW")
+            
+            # Process Triggers
+            comparator.process_object_directory(base_path / "triggers", "TRIGGER")
             
             print("\n" + "=" * 70)
             print("Generating Reports...")
@@ -276,19 +576,20 @@ jobs:
             comparator.generate_reports()
             
             print("\n" + "=" * 70)
-            print(f"Comparison Complete: {total_changes} change(s) detected")
+            print(f"Comparison Complete: {len(comparator.differences)} change(s) detected")
             print("=" * 70)
+
 
         if __name__ == "__main__":
             main()
         ENDCOMPARE
         
-        echo "Comparison script created"
+        echo "Complete comparison script created"
     
     - name: Compare Schemas
       if: github.ref != 'refs/heads/main'
       run: |
-        echo "Starting schema comparison..."
+        echo "Starting complete schema comparison..."
         python3 compare_schemas.py
     
     - name: Upload Migration Scripts
@@ -307,7 +608,7 @@ jobs:
         BRANCH_NAME=${GITHUB_REF##*/}
         if [ -f "diff-reports/summary-${BRANCH_NAME}.md" ]; then
           cat "diff-reports/summary-${BRANCH_NAME}.md" >> $GITHUB_STEP_SUMMARY
-        else
+        else:
           echo "## No Changes" >> $GITHUB_STEP_SUMMARY
           echo "Schema in branch matches main" >> $GITHUB_STEP_SUMMARY
         fi
@@ -332,5 +633,5 @@ jobs:
     
     - name: Pipeline Complete
       run: |
-        echo "Schema comparison completed"
+        echo "Complete schema comparison completed"
         echo "Branch: ${GITHUB_REF##*/}"
