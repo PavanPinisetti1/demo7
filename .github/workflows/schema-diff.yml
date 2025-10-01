@@ -31,7 +31,7 @@ jobs:
     
     - name: Create Schema Comparison Script
       run: |
-        cat > compare_schemas.py << 'ENDOFSCRIPT'
+        cat > compare_schemas.py << 'ENDCOMPARE'
         import re
         import os
         from pathlib import Path
@@ -43,81 +43,137 @@ jobs:
                 self.alter_statements = []
                 self.current_branch = os.environ.get('GITHUB_REF', '').split('/')[-1]
                 
-            def parse_ddl(self, ddl_content):
-                table_info = {'name': None, 'columns': {}}
-                table_match = re.search(r'create\s+table\s+(\w+\.\w+|\w+)\s*\(', ddl_content, re.IGNORECASE)
-                if table_match:
-                    table_info['name'] = table_match.group(1)
-                col_pattern = r'(\w+)\s+(number|varchar2|date|timestamp|clob|blob)(\([^\)]+\))?([^,\n]*?)(?:,|\)|;)'
-                for match in re.finditer(col_pattern, ddl_content, re.IGNORECASE):
-                    col_name = match.group(1).strip()
-                    col_type = match.group(2).strip().upper()
-                    col_size = match.group(3) if match.group(3) else ''
-                    col_attrs = match.group(4).strip()
-                    if col_name.upper() in ['CREATE', 'TABLE', 'ALTER', 'ADD', 'DROP', 'MODIFY', 'PRIMARY', 'KEY', 'CONSTRAINT', 'USING', 'INDEX', 'ENABLE', 'DISABLE']:
+            def extract_columns_from_ddl(self, ddl_content):
+                """Extract column names from DDL"""
+                columns = set()
+                in_create = False
+                
+                for line in ddl_content.split('\n'):
+                    line = line.strip()
+                    
+                    if 'create table' in line.lower():
+                        in_create = True
                         continue
-                    full_definition = f"{col_type}{col_size} {col_attrs}".strip()
-                    table_info['columns'][col_name.upper()] = full_definition
-                return table_info
+                    
+                    if in_create:
+                        if line.startswith('alter table') or line.startswith('--') or line.startswith(');'):
+                            break
+                        
+                        match = re.match(r'^(\w+)\s+(number|varchar2|date|timestamp|clob|blob|char)', line, re.IGNORECASE)
+                        if match:
+                            col_name = match.group(1).upper()
+                            if col_name not in ['CREATE', 'TABLE', 'CONSTRAINT', 'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'CHECK', 'UNIQUE', 'INDEX']:
+                                columns.add(col_name)
+                
+                return columns
+            
+            def get_column_definition(self, ddl_content, column_name):
+                """Extract the full definition of a specific column"""
+                lines = ddl_content.split('\n')
+                for i, line in enumerate(lines):
+                    if re.match(rf'^\s*{column_name}\s+', line, re.IGNORECASE):
+                        full_def = line.strip()
+                        j = i + 1
+                        while j < len(lines):
+                            next_line = lines[j].strip()
+                            if not next_line or next_line.startswith(',') or next_line == ');' or next_line.startswith('--'):
+                                break
+                            if not re.match(r'^\w+\s+(number|varchar2|date|timestamp|clob|blob)', next_line, re.IGNORECASE):
+                                full_def += ' ' + next_line
+                                j += 1
+                            else:
+                                break
+                        full_def = re.sub(r',\s*$', '', full_def)
+                        full_def = re.sub(r'\s+', ' ', full_def)
+                        return full_def
+                return None
             
             def compare_tables(self, main_ddl, current_ddl, table_file):
-                main_info = self.parse_ddl(main_ddl) if main_ddl else {'name': None, 'columns': {}}
-                current_info = self.parse_ddl(current_ddl)
-                table_name = current_info['name'] or main_info['name']
-                if not table_name:
-                    table_name = Path(table_file).stem.upper()
-                simple_table_name = table_name.split('.')[-1] if '.' in table_name else table_name
-                print(f"\nAnalyzing: {simple_table_name}")
-                main_cols = main_info['columns']
-                current_cols = current_info['columns']
-                new_cols = set(current_cols.keys()) - set(main_cols.keys())
+                """Compare table definitions between branches"""
+                table_name = Path(table_file).stem.upper()
+                print(f"\nAnalyzing table: {table_name}")
+                
+                if main_ddl:
+                    print("  Columns in MAIN branch:")
+                    main_cols = self.extract_columns_from_ddl(main_ddl)
+                    print(f"    {sorted(main_cols)}")
+                else:
+                    main_cols = set()
+                    print("  No version in MAIN branch (new table)")
+                
+                print("  Columns in CURRENT branch:")
+                current_cols = self.extract_columns_from_ddl(current_ddl)
+                print(f"    {sorted(current_cols)}")
+                
+                new_cols = current_cols - main_cols
+                dropped_cols = main_cols - current_cols
+                
                 for col in sorted(new_cols):
-                    col_def = current_cols[col]
-                    diff_msg = f"Added column '{col}' with definition: {col_def}"
-                    self.differences.append({'table': simple_table_name, 'type': 'ADD_COLUMN', 'message': diff_msg, 'column': col, 'definition': col_def})
-                    alter_stmt = f"ALTER TABLE {simple_table_name} ADD {col} {col_def};"
+                    col_def = self.get_column_definition(current_ddl, col)
+                    diff_msg = f"Added column '{col}'"
+                    self.differences.append({
+                        'table': table_name,
+                        'type': 'ADD_COLUMN',
+                        'message': diff_msg,
+                        'column': col,
+                        'definition': col_def
+                    })
+                    alter_stmt = f"ALTER TABLE {table_name} ADD {col_def};"
                     self.alter_statements.append(alter_stmt)
-                    print(f"  Added: {col}")
-                dropped_cols = set(main_cols.keys()) - set(current_cols.keys())
+                    print(f"  [NEW] {col}")
+                
                 for col in sorted(dropped_cols):
                     diff_msg = f"Dropped column '{col}'"
-                    self.differences.append({'table': simple_table_name, 'type': 'DROP_COLUMN', 'message': diff_msg, 'column': col})
-                    alter_stmt = f"ALTER TABLE {simple_table_name} DROP COLUMN {col};"
+                    self.differences.append({
+                        'table': table_name,
+                        'type': 'DROP_COLUMN',
+                        'message': diff_msg,
+                        'column': col
+                    })
+                    alter_stmt = f"ALTER TABLE {table_name} DROP COLUMN {col};"
                     self.alter_statements.append(alter_stmt)
-                    print(f"  Dropped: {col}")
-                common_cols = set(current_cols.keys()) & set(main_cols.keys())
-                for col in sorted(common_cols):
-                    if current_cols[col] != main_cols[col]:
-                        diff_msg = f"Modified column '{col}': {main_cols[col]} -> {current_cols[col]}"
-                        self.differences.append({'table': simple_table_name, 'type': 'MODIFY_COLUMN', 'message': diff_msg, 'column': col, 'old_def': main_cols[col], 'new_def': current_cols[col]})
-                        alter_stmt = f"ALTER TABLE {simple_table_name} MODIFY {col} {current_cols[col]};"
-                        self.alter_statements.append(alter_stmt)
-                        print(f"  Modified: {col}")
-                return len(new_cols) + len(dropped_cols) + len([c for c in common_cols if current_cols[c] != main_cols[c]])
+                    print(f"  [DROPPED] {col}")
+                
+                return len(new_cols) + len(dropped_cols)
             
             def generate_reports(self):
+                """Generate migration scripts and reports"""
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 branch = self.current_branch
+                
                 alter_file = Path(f"migration-scripts/migrate-{branch}.sql")
                 alter_file.parent.mkdir(parents=True, exist_ok=True)
+                
                 with open(alter_file, 'w') as f:
+                    f.write(f"-- =====================================================\n")
                     f.write(f"-- APEX Schema Migration Script\n")
+                    f.write(f"-- =====================================================\n")
                     f.write(f"-- Source Branch: main\n")
                     f.write(f"-- Target Branch: {branch}\n")
                     f.write(f"-- Generated: {timestamp}\n")
-                    f.write(f"-- Total Changes: {len(self.differences)}\n\n")
+                    f.write(f"-- Total Changes: {len(self.differences)}\n")
+                    f.write(f"-- =====================================================\n\n")
+                    
                     if self.alter_statements:
+                        f.write(f"-- Run this script to migrate from main to {branch}\n\n")
                         for stmt in self.alter_statements:
                             f.write(f"{stmt}\n")
+                        f.write(f"\n-- End of migration script\n")
                     else:
                         f.write("-- No schema changes detected\n")
+                
                 print(f"\nMigration script: {alter_file}")
+                
                 summary_file = Path(f"diff-reports/summary-{branch}.md")
                 summary_file.parent.mkdir(parents=True, exist_ok=True)
+                
                 with open(summary_file, 'w') as f:
-                    f.write(f"# Schema Changes: main -> {branch}\n\n")
+                    f.write(f"# Schema Changes: main to {branch}\n\n")
                     f.write(f"**Generated:** {timestamp}\n\n")
+                    f.write(f"**Repository:** https://github.com/PavanPinisetti1/demo7.git\n\n")
                     f.write(f"**Total Changes:** {len(self.differences)}\n\n")
+                    f.write(f"---\n\n")
+                    
                     if self.differences:
                         tables = {}
                         for diff in self.differences:
@@ -125,62 +181,102 @@ jobs:
                             if table not in tables:
                                 tables[table] = []
                             tables[table].append(diff)
+                        
                         f.write("## Changes by Table\n\n")
                         for table, changes in tables.items():
-                            f.write(f"### Table: `{table}`\n\n")
+                            f.write(f"### Table: {table}\n\n")
                             for change in changes:
-                                f.write(f"- **{change['type']}**: {change['message']}\n")
+                                f.write(f"- {change['type']}: {change['message']}\n")
                             f.write("\n")
-                        f.write("## Migration SQL Script\n\n```sql\n")
+                        
+                        f.write("---\n\n")
+                        f.write("## Migration SQL Script\n\n")
+                        f.write("```sql\n")
                         for stmt in self.alter_statements:
                             f.write(f"{stmt}\n")
-                        f.write("```\n")
+                        f.write("```\n\n")
                     else:
                         f.write("No schema differences detected.\n")
+                        f.write(f"The schema in branch {branch} is identical to main.\n")
+                
                 print(f"Summary report: {summary_file}")
                 return len(self.differences)
 
         def main():
+            print("=" * 70)
             print("APEX Schema Comparison Tool")
+            print("=" * 70)
+            
             comparator = APEXSchemaComparator()
             current_branch = comparator.current_branch
-            print(f"Current Branch: {current_branch}")
+            
+            print(f"\nCurrent Branch: {current_branch}")
+            
             if current_branch == 'main':
-                print("On main branch - no comparison needed")
+                print("\nOn main branch - no comparison needed")
                 return
+            
             schema_path = Path("src/database/wksp_ebs2cloud_migration/tables")
+            
             if not schema_path.exists():
-                print(f"Schema path not found: {schema_path}")
+                print(f"\nSchema path not found: {schema_path}")
                 return
+            
             print(f"Schema Path: {schema_path}")
+            
             sql_files = list(schema_path.glob("*.sql"))
+            
             if not sql_files:
-                print(f"No SQL files found in {schema_path}")
+                print(f"\nNo SQL files found in {schema_path}")
                 return
+            
             print(f"Found {len(sql_files)} SQL file(s)")
+            
             total_changes = 0
+            
             for sql_file in sql_files:
                 current_ddl = sql_file.read_text()
+                
                 try:
                     import subprocess
-                    result = subprocess.run(['git', 'show', f'main:{sql_file}'], capture_output=True, text=True)
+                    # Convert Path to string for git command
+                    git_path = str(sql_file)
+                    print(f"  Git command: git show main:{git_path}")
+                    
+                    result = subprocess.run(
+                        ['git', 'show', f'main:{git_path}'],
+                        capture_output=True,
+                        text=True,
+                        check=False
+                    )
+                    
                     if result.returncode == 0:
                         main_ddl = result.stdout
+                        print(f"  Successfully read main branch file ({len(main_ddl)} bytes)")
                     else:
-                        print(f"File {sql_file.name} doesn't exist in main branch")
+                        print(f"  File does not exist in main branch")
+                        print(f"  Git error: {result.stderr}")
                         main_ddl = None
                 except Exception as e:
-                    print(f"Error reading main branch: {e}")
+                    print(f"  Error reading main branch: {e}")
                     main_ddl = None
+                
                 changes = comparator.compare_tables(main_ddl, current_ddl, sql_file)
                 total_changes += changes
+            
+            print("\n" + "=" * 70)
             print("Generating Reports...")
+            print("=" * 70)
+            
             comparator.generate_reports()
+            
+            print("\n" + "=" * 70)
             print(f"Comparison Complete: {total_changes} change(s) detected")
+            print("=" * 70)
 
         if __name__ == "__main__":
             main()
-        ENDOFSCRIPT
+        ENDCOMPARE
         
         echo "Comparison script created"
     
@@ -208,7 +304,7 @@ jobs:
           cat "diff-reports/summary-${BRANCH_NAME}.md" >> $GITHUB_STEP_SUMMARY
         else
           echo "## No Changes" >> $GITHUB_STEP_SUMMARY
-          echo "Schema in **${BRANCH_NAME}** matches **main**" >> $GITHUB_STEP_SUMMARY
+          echo "Schema in branch matches main" >> $GITHUB_STEP_SUMMARY
         fi
     
     - name: Comment on Pull Request
@@ -225,11 +321,11 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## Schema Changes Detected\n\n${summary}\n\nDownload migration scripts from workflow artifacts.`
+              body: `## Schema Changes\n\n${summary}\n\nDownload migration scripts from artifacts.`
             });
           }
     
     - name: Pipeline Complete
       run: |
-        echo "Schema comparison completed!"
+        echo "Schema comparison completed"
         echo "Branch: ${GITHUB_REF##*/}"
